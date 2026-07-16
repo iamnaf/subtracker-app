@@ -24,7 +24,7 @@ supabase = get_supabase()
 
 # Dynamic Redirect URL configuration (Detects if live or local)
 # Set your production URL here when deploying (e.g., "https://your-app.streamlit.app")
-REDIRECT_URL = "http://localhost:8501"  
+REDIRECT_URL = "https://subtracker.streamlit.app/"  
 
 # ==============================================================================
 # 2. THE POPUP CALLBACK HANDLER (The magic sauce)
