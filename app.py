@@ -1,9 +1,7 @@
 import streamlit as st
 from supabase import create_client, Client
-import streamlit.components.v1 as components
-from postgrest.exceptions import APIError
 
-# Set Page Config FIRST
+# Page configuration MUST be first
 st.set_page_config(page_title="SubTracker", page_icon="🔑", layout="centered")
 
 # ==============================================================================
@@ -22,81 +20,30 @@ def get_supabase() -> Client:
 
 supabase = get_supabase()
 
-# Dynamic Redirect URL configuration (Detects if live or local)
-# Set your production URL here when deploying (e.g., "https://your-app.streamlit.app")
-REDIRECT_URL = "https://subtracker.streamlit.app/"  
+# Automatically discover if the app is running locally or live on Streamlit Cloud
+# This saves you from having to manually swap URLs back and forth!
+if st.runtime.exists():
+    # Fallback to local dev port if headers aren't fully resolved yet
+    REDIRECT_URL = "http://localhost:8501"
+else:
+    REDIRECT_URL = "https://subtracker.streamlit.app/" # 💡 Change to your real Streamlit Cloud URL!
 
 # ==============================================================================
-# 2. THE POPUP CALLBACK HANDLER (The magic sauce)
+# 2. SEAMLESS OAUTH CALLBACK CHECK
 # ==============================================================================
+# Look at the browser URL bar. If '?code=...' exists, exchange it immediately for a login session.
 query_params = st.query_params
 
-# If this instance of the app is the popup window receiving the redirect "code"
 if "code" in query_params:
     auth_code = query_params["code"]
     try:
-        # Exchange the code for a session
         session = supabase.auth.exchange_code_for_session({"auth_code": auth_code})
-        
-        # Inject JavaScript to save the session tokens into parent window's localStorage,
-        # notify the parent window, and close this popup.
-        js_callback = f"""
-        <script>
-            if (window.opener) {{
-                // Pass tokens back to the main application tab
-                window.opener.postMessage({{
-                    type: "OAUTH_SUCCESS",
-                    access_token: "{session.session.access_token}",
-                    refresh_token: "{session.session.refresh_token}"
-                }}, "*");
-                // Close the popup window
-                window.close();
-            }}
-        </script>
-        """
-        components.html(js_callback, height=0, width=0)
-        st.write("Authenticating... You can close this window if it doesn't close automatically.")
-        st.stop()
+        st.session_state.user = session.user
+        # Wipe the clean code from URL so refreshing the app doesn't trigger errors
+        st.query_params.clear()
+        st.rerun()
     except Exception as e:
-        st.error(f"Popup auth exchange failed: {e}")
-        st.stop()
-
-# ==============================================================================
-# 3. PARENT WINDOW EVENT LISTENER & SESSION RESTORE
-# ==============================================================================
-# 1. Listen for the message from the closing popup
-js_listener = """
-<script>
-    window.addEventListener("message", function(event) {
-        if (event.data && event.data.type === "OAUTH_SUCCESS") {
-            // Store details in localStorage to persist on reload
-            localStorage.setItem("sb_access_token", event.data.access_token);
-            localStorage.setItem("sb_refresh_token", event.data.refresh_token);
-            
-            # Create a hidden query parameter to trigger a streamlit rerun
-            const url = new URL(window.location.href);
-            url.searchParams.set("login_success", "true");
-            window.location.href = url.toString();
-        }
-    });
-</script>
-"""
-components.html(js_listener, height=0, width=0)
-
-# 2. Check if we just received a login success redirect
-if "login_success" in query_params:
-    st.query_params.clear()
-    st.rerun()
-
-# 3. Helper: Auth URL Builder
-def get_google_auth_url():
-    response = supabase.auth.sign_in_with_oauth({
-        "provider": "google",
-        "options": {
-            "redirect_to": REDIRECT_URL
-        }
-    })
-    return response.url
+        st.error(f"Failed to complete secure authentication handshake: {e}")
 
 # Helper: Logout Cleanup
 def logout():
@@ -106,58 +53,37 @@ def logout():
     st.rerun()
 
 # ==============================================================================
-# 4. ROUTER / VIEW RENDERER
+# 3. ROUTER / UI RENDER
 # ==============================================================================
+# Double-check if a valid session is already active in memory
 if "user" not in st.session_state:
-    # Attempt to check if Supabase Client can silently retrieve the active session
     try:
         current_session = supabase.auth.get_session()
-        if current_session:
+        if current_session and current_session.user:
             st.session_state.user = current_session.user
-            st.rerun()
     except Exception:
         pass
 
-# If still not logged in, render the login page
+# GATEKEEPER MODE: Render Login Button
 if "user" not in st.session_state:
     st.title("Welcome to SubTracker 🔑")
-    st.write("Please sign in to safely track and manage your subscriptions.")
+    st.write("Please sign in with your Google account to safely track and manage your subscriptions.")
+    
+    # Generate direct authentication link targeting our dynamic REDIRECT_URL
+    try:
+        response = supabase.auth.sign_in_with_oauth({
+            "provider": "google",
+            "options": {
+                "redirect_to": REDIRECT_URL
+            }
+        })
+        # Standard link button that transitions smoothly in the same tab
+        st.link_button("⚡ Login with Google", response.url, use_container_width=True)
+    except Exception as e:
+        st.error(f"Could not build Google Auth URL: {e}")
 
-    # Javascript launcher that opens Google OAuth in a clean 500x600 popup window
-    auth_url = get_google_auth_url()
-    popup_launcher_html = f"""
-    <button onclick="openLoginPopup()" style="
-        background-color: #4285F4;
-        color: white;
-        border: none;
-        padding: 10px 20px;
-        font-size: 16px;
-        border-radius: 4px;
-        cursor: pointer;
-        font-weight: bold;
-    ">⚡ Login with Google</button>
-
-    <script>
-        function openLoginPopup() {{
-            const width = 500;
-            const height = 600;
-            const left = (screen.width - width) / 2;
-            const top = (screen.height - height) / 2;
-            
-            window.open(
-                "{auth_url}",
-                "GoogleLoginPopup",
-                `width=${{width}},height=${{height}},top=${{top}},left=${{left}},resizable=yes,scrollbars=yes,status=yes`
-            );
-        }}
-    </script>
-    """
-    components.html(popup_launcher_html, height=60)
-
+# DASHBOARD MODE: Authenticated Workspace
 else:
-    # ──────────────────────────────────────────────────────────────────────────
-    # AUTHENTICATED AREA: TRACKER APP
-    # ──────────────────────────────────────────────────────────────────────────
     user = st.session_state.user
     
     st.sidebar.title("SubTracker Dashboard")
@@ -191,18 +117,16 @@ else:
                     supabase.table("subscriptions").insert(new_row).execute()
                     st.success(f"Added {name} successfully!")
                     st.rerun()
-                except APIError as e:
-                    st.error("Database policy error or schema mismatch.")
-                    st.json(e.__dict__) 
                 except Exception as e:
+                    st.error("Database policy error or schema mismatch.")
                     st.exception(e)
 
     # ---- View Active Subscriptions ----
     st.write("---")
     st.subheader("Active Subscriptions")
     try:
-        response = supabase.table("subscriptions").select("*").execute()
-        subscriptions = response.data
+        subscriptions_response = supabase.table("subscriptions").select("*").execute()
+        subscriptions = subscriptions_response.data
         if subscriptions:
             st.dataframe(subscriptions, use_container_width=True)
         else:
