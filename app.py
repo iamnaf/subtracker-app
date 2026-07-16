@@ -1,174 +1,137 @@
 import streamlit as st
-from st_supabase_connection import SupabaseConnection
-import pandas as pd
-import datetime
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-import re
+from supabase import create_client, Client
+from postgrest.exceptions import APIError
 
-# Set page config
-st.set_page_config(page_title="SubTrackr", page_icon="📱", layout="centered")
-
-# --- INITIALIZE SUPABASE CONNECTION ---
-# This safely handles our database queries via streamlit secrets
-conn = st.connection("supabase", type=SupabaseConnection)
-
-# --- SMTP EMAIL HELPER ---
-def send_notification_email(recipient_email, sub_name, days_left, cost, currency):
-    try:
-        sender_email = st.secrets["SENDER_EMAIL"]
-        sender_password = st.secrets["SENDER_PASSWORD"]
-        smtp_server = st.secrets["SMTP_SERVER"]
-        smtp_port = st.secrets["SMTP_PORT"]
-
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"⏰ Subscription Alert: {sub_name} is renewing soon!"
-        msg["From"] = f"SubTrackr <{sender_email}>"
-        msg["To"] = recipient_email
-
-        html = f"""
-        <html>
-          <body style="font-family: Arial, sans-serif; background-color: #f4f4f5; padding: 20px;">
-            <div style="max-width: 500px; margin: 0 auto; background: #ffffff; padding: 30px; border-radius: 12px; border: 1px solid #e4e4e7;">
-              <h2 style="color: #10b981; margin-top: 0;">SubTrackr Reminder</h2>
-              <p>Hello,</p>
-              <p>This is a quick reminder that your subscription for <strong>{sub_name}</strong> is renewing in <strong>{days_left} days</strong>.</p>
-              <div style="background-color: #f4f4f5; padding: 15px; border-radius: 8px; margin: 20px 0;">
-                <p style="margin: 5px 0;"><strong>Subscription:</strong> {sub_name}</p>
-                <p style="margin: 5px 0;"><strong>Cost:</strong> {cost} {currency}</p>
-              </div>
-              <p style="font-size: 13px; color: #71717a;">Make sure to review this subscription before the renewal date!</p>
-              <hr style="border: none; border-top: 1px solid #e4e4e7; margin: 20px 0;" />
-              <p style="font-size: 11px; color: #a1a1aa; text-align: center;">Sent automatically by your SubTrackr App.</p>
-            </div>
-          </body>
-        </html>
-        """
-        msg.attach(MIMEText(html, "html"))
-
-        with smtplib.SMTP_SSL(smtp_server, smtp_port) as server:
-            server.login(sender_email, sender_password)
-            server.sendmail(sender_email, recipient_email, msg.as_string())
-        return True
-    except Exception as e:
-        st.error(f"Email system is not fully configured yet in Streamlit Secrets. (Error: {e})")
-        return False
-
-def is_valid_email(email):
-    pattern = r'^[\w\.-]+@[\w\.-]+\.\w+$'
-    return re.match(pattern, email) is not None
-
-# --- INITIALIZE USER SESSION ---
-if "user_email" not in st.session_state:
-    st.session_state.user_email = None
-
-# --- LOGIN SCREEN ---
-if st.session_state.user_email is None:
-    st.title("SubTrackr 📱")
-    st.write("Track your subscriptions and sync across devices simply using your email address.")
-    
-    tab1, tab2 = st.tabs(["Log In", "Sign Up"])
-    
-    with tab1:
-        login_email = st.text_input("Enter your Email Address", key="login_email_input").lower().strip()
-        if st.button("Log In"):
-            if is_valid_email(login_email):
-                st.session_state.user_email = login_email
-                st.rerun()
-            else:
-                st.error("Please enter a valid email address.")
-                
-    with tab2:
-        signup_email = st.text_input("Enter your Email Address", key="signup_email_input").lower().strip()
-        if st.button("Create Account"):
-            if is_valid_email(signup_email):
-                st.session_state.user_email = signup_email
-                st.success("Account created successfully!")
-                st.rerun()
-            else:
-                st.error("Please enter a valid email address.")
-                
+# ==============================================================================
+# 1. INITIALIZE SUPABASE CLIENT
+# ==============================================================================
+# Ensure SUPABASE_URL and SUPABASE_KEY are defined at the root level of secrets
+try:
+    URL: str = st.secrets["SUPABASE_URL"]
+    KEY: str = st.secrets["SUPABASE_KEY"]
+except KeyError:
+    st.error("Missing credentials! Please add SUPABASE_URL and SUPABASE_KEY to your Streamlit secrets.")
     st.stop()
 
-# --- ACTIVE SESSION ---
-user_email = st.session_state.user_email
+@st.cache_resource
+def get_supabase() -> Client:
+    return create_client(URL, KEY)
 
-with st.sidebar:
-    st.write(f"Logged in as:")
-    st.info(user_email)
-    if st.button("Log Out"):
-        st.session_state.user_email = None
+supabase = get_supabase()
+
+# Define where Google should send users back after authenticating.
+# Change this to your production URL when deploying (e.g., "https://your-app.streamlit.app")
+REDIRECT_URL = "http://localhost:8501" 
+
+# ==============================================================================
+# 2. HANDLE OAUTH CALLBACK (PKCE FLOW)
+# ==============================================================================
+# If Google redirects back with a code parameter, exchange it for a session
+query_params = st.query_params
+
+if "code" in query_params:
+    auth_code = query_params["code"]
+    try:
+        session = supabase.auth.exchange_code_for_session({"auth_code": auth_code})
+        st.session_state.user = session.user
+        # Clear the code from the URL bar to keep things clean
+        st.query_params.clear() 
         st.rerun()
+    except Exception as e:
+        st.error(f"Authentication failed: {e}")
 
-st.title("My Subscriptions 📱")
+# Auth Helper Functions
+def login_with_google():
+    response = supabase.auth.sign_in_with_oauth({
+        "provider": "google",
+        "options": {
+            "redirect_to": REDIRECT_URL
+        }
+    })
+    return response.url
 
-# --- FETCH USER DATA FROM SUPABASE ---
-# We query the 'subscriptions' table filtering by the logged-in email
-response = conn.table("subscriptions").select("id, name, cost, currency, cycle, next_renewal").eq("email", user_email).execute()
+def logout():
+    supabase.auth.sign_out()
+    if "user" in st.session_state:
+        del st.session_state.user
+    st.rerun()
 
-# Convert returned data to a pandas DataFrame
-if response.data:
-    user_df = pd.DataFrame(response.data)
+# ==============================================================================
+# 3. APP UI ROUTER
+# ==============================================================================
+if "user" not in st.session_state:
+    # ──────────────────────────────────────────────────────────────────────────
+    # GATEKEEPER: LOGIN SCREEN
+    # ──────────────────────────────────────────────────────────────────────────
+    st.title("Welcome to SubTracker 🔑")
+    st.write("Please sign in with Google to safely track and manage your subscriptions.")
+    
+    # Generate the authorization URL and present the login button
+    google_login_url = login_with_google()
+    st.link_button("⚡ Login with Google", google_login_url)
+
 else:
-    user_df = pd.DataFrame(columns=["id", "name", "cost", "currency", "cycle", "next_renewal"])
-
-# --- EXPIRATION ALERTS ENGINE ---
-if not user_df.empty:
-    user_df["next_renewal"] = pd.to_datetime(user_df["next_renewal"]).dt.date
-    today = datetime.date.today()
+    # ──────────────────────────────────────────────────────────────────────────
+    # MAIN APP: AUTHENTICATED ZONE
+    # ──────────────────────────────────────────────────────────────────────────
+    user = st.session_state.user
     
-    imminent_alerts = []
-    for idx, row in user_df.iterrows():
-        days_left = (row["next_renewal"] - today).days
-        if 0 < days_left <= 3:
-            imminent_alerts.append((row["name"], days_left, row["cost"], row["currency"]))
-            
-    if imminent_alerts:
-        st.warning("⚠️ You have upcoming renewals!")
-        for name, days, cost, currency in imminent_alerts:
-            st.write(f"• **{name}** is renewing in **{days} days**.")
-            
-            # Simple session-level email sending guard
-            email_key = f"sent_{name}_{user_email}_{today}"
-            if email_key not in st.session_state:
-                sent = send_notification_email(user_email, name, days, cost, currency)
-                if sent:
-                    st.session_state[email_key] = True
-                    st.success(f"Notification email sent to {user_email}!")
+    # Sidebar Navigation / Logout
+    st.sidebar.title("SubTracker Dashboard")
+    st.sidebar.write(f"Logged in as: **{user.email}**")
+    if st.sidebar.button("Log Out"):
+        logout()
 
-    # Display clean table (hide 'id')
-    st.dataframe(user_df.drop(columns=["id"]), use_container_width=True)
-else:
-    st.info("You haven't added any subscriptions yet! Add one below.")
+    st.title("Your Subscription Tracker")
+    st.write("Manage your running services and upcoming billings below.")
 
-# --- ADD NEW SUBSCRIPTION FORM ---
-with st.form("add_sub_form", clear_on_submit=True):
-    st.write("### Add New Subscription")
-    name = st.text_input("Subscription Name")
-    cost = st.number_input("Cost", min_value=0.0, step=0.01)
-    currency = st.selectbox("Currency", ["USD", "EUR", "GBP", "NGN"])
-    cycle = st.selectbox("Billing Cycle", ["Weekly", "Monthly", "Annual"])
-    next_renewal = st.date_input("Next Renewal Date", min_value=datetime.date.today())
+    # ──── Form to Add a New Subscription ────
+    st.subheader("Add New Subscription")
     
-    submit = st.form_submit_button("Save Subscription")
+    with st.form("add_subscription_form", clear_on_submit=True):
+        name = st.text_input("Service Name (e.g., Netflix, Spotify)")
+        cost = st.number_input("Monthly Cost ($)", min_value=0.0, step=0.01)
+        billing_date = st.date_input("Next Billing Date")
+        
+        submit_button = st.form_submit_button("Save Subscription")
+        
+        if submit_button:
+            if not name:
+                st.error("Please enter a service name.")
+            else:
+                # Structure row explicitly, linking it to the logged-in user's UUID
+                new_row = {
+                    "user_id": user.id,          # Automatically captured from active Google session
+                    "name": name,
+                    "cost": cost,
+                    "billing_date": str(billing_date)
+                }
+                
+                # Execute Insert Query with debug block for quick RLS/Schema isolation
+                try:
+                    supabase.table("subscriptions").insert(new_row).execute()
+                    st.success(f"Added {name} successfully!")
+                    st.rerun()
+                except APIError as e:
+                    st.error("Database policy error or schema mismatch encountered.")
+                    # Keep this active while verifying your RLS settings match the user.id link!
+                    st.json(e.__dict__) 
+                except Exception as e:
+                    st.exception(e)
+
+    # ──── View Existing Subscriptions ────
+    st.write("---")
+    st.subheader("Active Subscriptions")
     
-    if submit:
-        if name and cost > 0:
-            # Prepare payload for Supabase insert
-            new_row = {
-                "email": user_email,
-                "name": name,
-                "cost": cost,
-                "currency": currency,
-                "cycle": cycle,
-                "next_renewal": next_renewal.strftime("%Y-%m-%d")
-            }
-            
-            # Execute insert query
-            conn.table("subscriptions").insert(new_row).execute()
-            
-            st.success(f"Added {name} successfully!")
-            st.rerun()
+    try:
+        # Fetching data dynamically based on your RLS rule (auth.uid() = user_id)
+        response = supabase.table("subscriptions").select("*").execute()
+        subscriptions = response.data
+        
+        if subscriptions:
+            st.dataframe(subscriptions, use_container_width=True)
         else:
-            st.error("Please enter a valid name and cost.")
+            st.info("No active subscriptions logged yet. Add one above!")
+            
+    except Exception as e:
+        st.warning("Could not fetch active subscriptions list. Verify your SELECT RLS policies.")
