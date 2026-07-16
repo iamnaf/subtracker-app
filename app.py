@@ -21,7 +21,7 @@ supabase = get_supabase()
 
 # Define where Google should send users back after authenticating.
 # Change this to your production URL when deploying (e.g., "https://your-app.streamlit.app")
-REDIRECT_URL = "http://localhost:8501" 
+REDIRECT_URL = "https://subtracker.streamlit.app/" 
 
 # ==============================================================================
 # 2. HANDLE OAUTH CALLBACK (PKCE FLOW)
