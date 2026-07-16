@@ -6,23 +6,6 @@ from postgrest.exceptions import APIError
 # 1. INITIALIZE SUPABASE CLIENT
 # ==============================================================================
 # Ensure SUPABASE_URL and SUPABASE_KEY are defined at the root level of secrets
-# 🚨 TEMPORARY SECRETS DIAGNOSTIC
-st.write("### 🔍 Live Streamlit Secrets Debugger")
-try:
-    # Get all keys available in st.secrets
-    available_keys = list(st.secrets.keys())
-    st.info(f"Root secrets keys found: {available_keys}")
-    
-    # Check if there are nested dictionaries (like [connections] or [supabase])
-    for key in available_keys:
-        if isinstance(st.secrets[key], dict):
-            st.write(f"Nested dictionary found under `[{key}]`: {list(st.secrets[key].keys())}")
-except Exception as e:
-    st.error(f"Error reading secrets structure: {e}")
-
-st.write("---")
-
-# Rest of your initialization logic...
 try:
     URL: str = st.secrets["SUPABASE_URL"]
     KEY: str = st.secrets["SUPABASE_KEY"]
