@@ -1,4 +1,5 @@
 import streamlit as st
+import pandas as pd
 from supabase import create_client, Client
 from postgrest.exceptions import APIError
 from datetime import datetime, date, timedelta
@@ -75,10 +76,12 @@ def calculate_next_renewal(start_date: date, cycle: str) -> date:
         except ValueError:  # Leap year fallback (Feb 29 -> Feb 28)
             return start_date + timedelta(days=365)
     elif cycle == "Monthly":
-        # Standard 30-day billing jump across months
         month = start_date.month % 12 + 1
         year = start_date.year + (start_date.month // 12)
-        day = min(start_date.day, [31, 29 if year % 4 == 0 and (year % 100 != 0 or year % 400 == 0) else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1])
+        day = min(
+            start_date.day,
+            [31, 29 if year % 4 == 0 and (year % 100 != 0 or year % 400 == 0) else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1]
+        )
         return date(year, month, day)
     
     return start_date
@@ -115,7 +118,21 @@ else:
         subscriptions = response.data
         
         if subscriptions:
-            st.dataframe(subscriptions, use_container_width=True)
+            # Format and filter raw database output into specified schema columns
+            formatted_data = []
+            for idx, item in enumerate(subscriptions, start=1):
+                formatted_data.append({
+                    "S/N": idx,
+                    "Subscription": item.get("name", "N/A"),
+                    "Cost": f"{float(item.get('cost', 0)):,.2f}",
+                    "Currency": item.get("currency", "N/A"),
+                    "Cycle": item.get("cycle", "N/A"),
+                    "Start Date": item.get("start_date", item.get("created_at", "N/A")),
+                    "Renewal Date": item.get("next_renewal", "N/A")
+                })
+            
+            df = pd.DataFrame(formatted_data)
+            st.dataframe(df, use_container_width=True, hide_index=True)
         else:
             st.info("No active subscriptions logged yet. Add one using the form below!")
     except Exception as e:
@@ -147,6 +164,7 @@ else:
                     "cost": cost,
                     "currency": currency.split()[0],
                     "cycle": cycle,
+                    "start_date": str(current_sub_date),
                     "next_renewal": str(computed_next_renewal)
                 }
                 
