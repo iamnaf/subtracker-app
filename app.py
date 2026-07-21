@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import requests
+import resend
 from supabase import create_client, Client
 from postgrest.exceptions import APIError
 from datetime import datetime, date, timedelta
@@ -13,6 +14,9 @@ st.set_page_config(page_title="SubTracker", page_icon="🔑", layout="centered")
 try:
     URL: str = st.secrets["SUPABASE_URL"]
     KEY: str = st.secrets["SUPABASE_KEY"]
+    RESEND_KEY: str = st.secrets.get("RESEND_API_KEY", "")
+    if RESEND_KEY:
+        resend.api_key = RESEND_KEY
 except KeyError:
     st.error("Missing credentials! Please add SUPABASE_URL and SUPABASE_KEY to your Streamlit secrets.")
     st.stop()
@@ -65,7 +69,7 @@ if "user" not in st.session_state:
         pass
 
 # ==============================================================================
-# 3. HELPER FUNCTIONS: DATES & LIVE EXCHANGE RATES
+# 3. HELPER FUNCTIONS: DATES, EXCHANGE RATES & LIVE EMAIL ALERTS
 # ==============================================================================
 def calculate_next_renewal(start_date: date, cycle: str) -> date:
     """Calculates next billing date using Python standard library only."""
@@ -87,7 +91,7 @@ def calculate_next_renewal(start_date: date, cycle: str) -> date:
     
     return start_date
 
-@st.cache_data(ttl=3600)  # Cache rates for 1 hour
+@st.cache_data(ttl=3600)
 def fetch_exchange_rates():
     """Fetches live USD-based conversion rates from open.er-api.com."""
     try:
@@ -98,24 +102,45 @@ def fetch_exchange_rates():
             return data.get("rates", {})
     except Exception:
         pass
-    # Fallback default static matrix in case network API is unreachable
     return {"USD": 1.0, "NGN": 1500.0, "EUR": 0.92, "GBP": 0.78}
 
 def convert_currency(amount: float, from_curr: str, to_curr: str, rates: dict) -> float:
     """Converts amount from one currency to target currency using USD baseline rates."""
     if from_curr == to_curr or amount == 0:
         return amount
-    
-    # Strip symbolic wrappers if present (e.g. "USD ($)" -> "USD")
     clean_from = str(from_curr).split()[0]
     clean_to = str(to_curr).split()[0]
-    
     rate_from = rates.get(clean_from, 1.0)
     rate_to = rates.get(clean_to, 1.0)
-    
-    # Convert source amount to USD, then from USD to target currency
     amount_in_usd = amount / rate_from
     return amount_in_usd * rate_to
+
+def send_renewal_alert(email: str, sub_name: str, cost: float, currency: str, renewal_date_str: str, is_trial: bool):
+    """Sends an automated HTML alert email via Resend."""
+    if not RESEND_KEY:
+        return False
+    
+    type_label = "Free Trial Expiration" if is_trial else "Upcoming Renewal"
+    badge_color = "#e53e3e" if is_trial else "#3182ce"
+    
+    html_content = f"""
+    <div style="font-family: sans-serif; max-width: 500px; margin: auto; padding: 20px; border: 1px solid #e2e8f0; border-radius: 8px;">
+        <span style="background-color: {badge_color}; color: white; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; text-transform: uppercase;">{type_label}</span>
+        <h2 style="margin-top: 15px; color: #1a202c;">3-Day Notice: {sub_name}</h2>
+        <p style="color: #4a5568;">Your {sub_name} service is set to re-bill on <strong>{renewal_date_str}</strong> for <strong>{currency} {cost:,.2f}</strong>.</p>
+        <p style="color: #718096; font-size: 13px;">Review or edit this subscription anytime on your SubTracker app.</p>
+    </div>
+    """
+    try:
+        resend.Emails.send({
+            "from": "SubTracker <onboarding@resend.dev>",
+            "to": [email],
+            "subject": f"🔔 Notice: {sub_name} re-bills in 3 days",
+            "html": html_content
+        })
+        return True
+    except Exception:
+        return False
 
 # ==============================================================================
 # 4. APP VIEW ROUTER
@@ -138,7 +163,6 @@ else:
     st.sidebar.title("SubTracker Settings")
     st.sidebar.write(f"Logged in as: **{user.email}**")
     
-    # Default Currency Selection
     currency_options = ["USD ($)", "NGN (₦)", "EUR (€)", "GBP (£)"]
     default_currency = st.sidebar.selectbox("Default Preferred Currency", currency_options, index=0)
     target_currency_code = default_currency.split()[0]
@@ -150,8 +174,47 @@ else:
     st.title("Your Subscription Tracker")
     st.write("Manage your running services and upcoming billings below.")
 
-    # ──── 1. SUMMARY METRICS MODULE ────
+    # ──── 1. LIVE RENEWAL & TRIAL CHECKER (AUTOMATED ALERTS) ────
     today = date.today()
+    three_days_out = today + timedelta(days=3)
+    
+    try:
+        response = supabase.table("subscriptions").select("*").eq("email", user.email).execute()
+        subscriptions = response.data or []
+    except Exception:
+        subscriptions = []
+
+    # Auto-detect items renewing within 3 days
+    urgent_alerts = []
+    for sub in subscriptions:
+        raw_renewal = sub.get("next_renewal")
+        if raw_renewal:
+            try:
+                r_date = datetime.strptime(str(raw_renewal)[:10], "%Y-%m-%d").date()
+                if today <= r_date <= three_days_out:
+                    urgent_alerts.append((sub, r_date))
+            except Exception:
+                pass
+
+    if urgent_alerts:
+        for sub_item, r_date in urgent_alerts:
+            days_left = (r_date - today).days
+            is_trial = sub_item.get("is_trial", False)
+            tag = "FREE TRIAL" if is_trial else "SUBSCRIPTION"
+            
+            day_text = "today" if days_left == 0 else f"in {days_left} day(s)"
+            st.warning(f"⚠️ **{tag} ALERT:** **{sub_item['name']}** re-bills {day_text} ({r_date.strftime('%b %d, %Y')}) for **{sub_item.get('currency', 'USD')} {float(sub_item.get('cost', 0)):,.2f}**.")
+            
+            # Send live background email if RESEND_KEY is configured
+            if RESEND_KEY and not st.session_state.get(f"alert_sent_{sub_item['id']}"):
+                sent = send_renewal_alert(
+                    user.email, sub_item['name'], float(sub_item.get('cost', 0)), 
+                    sub_item.get('currency', 'USD'), str(r_date), is_trial
+                )
+                if sent:
+                    st.session_state[f"alert_sent_{sub_item['id']}"] = True
+
+    # ──── 2. SUMMARY METRICS MODULE ────
     full_date_str = today.strftime("%A, %d %B %Y")
     current_month_str = today.strftime("%B %Y")
     current_year_str = today.strftime("%Y")
@@ -159,67 +222,47 @@ else:
     total_month_cost = 0.0
     total_year_cost = 0.0
     
-    try:
-        response = supabase.table("subscriptions").select("*").eq("email", user.email).execute()
-        subscriptions = response.data or []
-        
-        for item in subscriptions:
-            raw_start = item.get("start_date") or item.get("created_at")
-            if raw_start:
-                try:
-                    s_date = datetime.strptime(str(raw_start)[:10], "%Y-%m-%d").date()
-                    item_cost = float(item.get("cost", 0))
-                    item_curr = item.get("currency", "USD")
+    for item in subscriptions:
+        raw_start = item.get("start_date") or item.get("created_at")
+        if raw_start:
+            try:
+                s_date = datetime.strptime(str(raw_start)[:10], "%Y-%m-%d").date()
+                item_cost = float(item.get("cost", 0))
+                item_curr = item.get("currency", "USD")
+                converted_item_cost = convert_currency(item_cost, item_curr, target_currency_code, live_rates)
 
-                    # Convert original item cost to chosen user default currency
-                    converted_item_cost = convert_currency(item_cost, item_curr, target_currency_code, live_rates)
+                if s_date.year == today.year:
+                    total_year_cost += converted_item_cost
+                    if s_date.month == today.month:
+                        total_month_cost += converted_item_cost
+            except Exception:
+                pass
 
-                    if s_date.year == today.year:
-                        total_year_cost += converted_item_cost
-                        
-                        if s_date.month == today.month:
-                            total_month_cost += converted_item_cost
-                except Exception:
-                    pass
-    except Exception:
-        subscriptions = []
-
-    # Display Metrics Banner
     st.caption(f"📅 **Today:** {full_date_str}")
     col1, col2 = st.columns(2)
     with col1:
-        st.metric(
-            label=f"Total Cost ({current_month_str})", 
-            value=f"{target_currency_code} {total_month_cost:,.2f}"
-        )
+        st.metric(label=f"Total Cost ({current_month_str})", value=f"{target_currency_code} {total_month_cost:,.2f}")
     with col2:
-        st.metric(
-            label=f"Total Cost ({current_year_str} YTD)", 
-            value=f"{target_currency_code} {total_year_cost:,.2f}"
-        )
+        st.metric(label=f"Total Cost ({current_year_str} YTD)", value=f"{target_currency_code} {total_year_cost:,.2f}")
 
     st.write("---")
 
-    # ──── 2. EDITABLE ACTIVE SUBSCRIPTIONS & ONE-CLICK ACTIONS ────
+    # ──── 3. EDITABLE ACTIVE SUBSCRIPTIONS & ACTIONS ────
     st.subheader(f"Active Subscriptions (In {target_currency_code})")
     
     if subscriptions:
-        # Construct DataFrame for st.data_editor
         table_rows = []
         for idx, item in enumerate(subscriptions, start=1):
             raw_cost = float(item.get('cost', 0))
             raw_curr = item.get("currency", "USD")
-            
-            # Compute live converted cost for reference
             converted_val = convert_currency(raw_cost, raw_curr, target_currency_code, live_rates)
-
-            # Standardize start_date format
             s_date_str = str(item.get("start_date") or item.get("created_at") or today)[:10]
 
             table_rows.append({
                 "id": item.get("id"),
                 "S/N": idx,
                 "Service Name": item.get("name", "N/A"),
+                "Type": "Free Trial" if item.get("is_trial") else "Paid Sub",
                 "Cost": raw_cost,
                 "Currency": raw_curr,
                 "Converted Cost": f"{target_currency_code} {converted_val:,.2f}",
@@ -230,13 +273,13 @@ else:
         
         df = pd.DataFrame(table_rows)
 
-        # Render Interactive Table
         edited_df = st.data_editor(
             df,
             column_config={
-                "id": None,  # Hide internal primary key column
+                "id": None,
                 "S/N": st.column_config.NumberColumn("S/N", disabled=True, width="small"),
                 "Service Name": st.column_config.TextColumn("Service Name", required=True),
+                "Type": st.column_config.SelectboxColumn("Type", options=["Paid Sub", "Free Trial"], required=True),
                 "Cost": st.column_config.NumberColumn("Cost", min_value=0.0, format="%.2f", required=True),
                 "Currency": st.column_config.SelectboxColumn("Currency", options=["USD", "NGN", "EUR", "GBP"], required=True),
                 "Converted Cost": st.column_config.TextColumn(f"Cost ({target_currency_code})", disabled=True),
@@ -249,11 +292,9 @@ else:
             key="subscriptions_editor"
         )
 
-        # Save inline table edits button
         if st.button("💾 Save Table Changes", use_container_width=True):
             try:
                 for idx, row in edited_df.iterrows():
-                    # Recalculate next renewal based on edited start date and cycle
                     parsed_start = datetime.strptime(str(row["Start Date"])[:10], "%Y-%m-%d").date()
                     updated_next_renewal = calculate_next_renewal(parsed_start, row["Cycle"])
 
@@ -262,6 +303,7 @@ else:
                         "cost": float(row["Cost"]),
                         "currency": str(row["Currency"]).split()[0],
                         "cycle": row["Cycle"],
+                        "is_trial": (row["Type"] == "Free Trial"),
                         "start_date": str(parsed_start),
                         "next_renewal": str(updated_next_renewal)
                     }).eq("id", row["id"]).execute()
@@ -271,27 +313,26 @@ else:
             except Exception as e:
                 st.error(f"Failed to update table records: {e}")
 
-        # Quick Actions Drawer (One-Click Renew & Delete)
+        # Quick Actions Drawer
         with st.expander("⚡ Row Actions (Renew / Delete Subscription)"):
             sub_names = {row["id"]: f"{row['Service Name']} ({row['Currency']} {row['Cost']:,.2f})" for _, row in df.iterrows()}
             selected_sub_id = st.selectbox("Select Subscription", options=list(sub_names.keys()), format_func=lambda x: sub_names[x])
 
             act_col1, act_col2 = st.columns(2)
             
-            # One-Click Renew
             with act_col1:
                 if st.button("⚡ One-Click Renew", use_container_width=True):
                     sub_item = next((item for item in subscriptions if item["id"] == selected_sub_id), None)
                     if sub_item:
                         try:
-                            # Use existing renewal date as the new start date
                             prev_renewal_str = sub_item.get("next_renewal") or str(today)
                             new_start = datetime.strptime(prev_renewal_str[:10], "%Y-%m-%d").date()
                             new_next_renewal = calculate_next_renewal(new_start, sub_item.get("cycle", "Monthly"))
 
                             supabase.table("subscriptions").update({
                                 "start_date": str(new_start),
-                                "next_renewal": str(new_next_renewal)
+                                "next_renewal": str(new_next_renewal),
+                                "is_trial": False  # Automatically converts to paid on manual renewal
                             }).eq("id", selected_sub_id).execute()
 
                             st.success(f"Renewed {sub_item['name']}! Next renewal set for {new_next_renewal}.")
@@ -299,7 +340,6 @@ else:
                         except Exception as e:
                             st.error(f"Could not renew subscription: {e}")
 
-            # Delete Subscription
             with act_col2:
                 if st.button("🗑️ Delete Subscription", type="secondary", use_container_width=True):
                     try:
@@ -314,15 +354,16 @@ else:
 
     st.write("---")
 
-    # ──── 3. FORM MODULE (Add Subscriptions) ────
+    # ──── 4. FORM MODULE (Add Subscriptions / Free Trials) ────
     st.subheader("Add New Subscription")
     with st.form("add_subscription_form", clear_on_submit=True):
         name = st.text_input("Service Name (e.g., Netflix, Spotify)")
         cost = st.number_input("Cost", min_value=0.0, step=0.01)
         currency = st.selectbox("Currency", currency_options)
         cycle = st.selectbox("Billing Cycle", ["Monthly", "Yearly", "Weekly"])
+        is_trial = st.checkbox("Is this a Free Trial?")
         
-        current_sub_date = st.date_input("Current / Last Payment Date", value=datetime.today())
+        current_sub_date = st.date_input("Start / Last Payment Date", value=datetime.today())
         
         submit_button = st.form_submit_button("Save Subscription")
         
@@ -338,6 +379,7 @@ else:
                     "cost": cost,
                     "currency": currency.split()[0],
                     "cycle": cycle,
+                    "is_trial": is_trial,
                     "start_date": str(current_sub_date),
                     "next_renewal": str(computed_next_renewal)
                 }
@@ -347,7 +389,7 @@ else:
                     st.success(f"Added {name}! Next renewal set for {computed_next_renewal.strftime('%Y-%m-%d')}.")
                     st.rerun()
                 except APIError as e:
-                    st.error("Database policy block or schema structural mismatch.")
+                    st.error("Database policy block or missing column.")
                     st.json(e.__dict__) 
                 except Exception as e:
                     st.exception(e)
