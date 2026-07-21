@@ -1,6 +1,5 @@
 import streamlit as st
 from supabase import create_client, Client
-import streamlit.components.v1 as components
 from postgrest.exceptions import APIError
 
 # ==============================================================================
@@ -25,66 +24,23 @@ supabase = get_supabase()
 REDIRECT_URL = "https://subtracker.streamlit.app/"  
 
 # ==============================================================================
-# 2. POPUP WINDOW CALLBACK HANDLER (PKCE EXCHANGE INTERCEPTOR)
+# 2. SEAMLESS SINGLE-TAB OAUTH HANDSHAKE
 # ==============================================================================
 query_params = st.query_params
 
-# If this specific thread execution is running inside the temporary popup window
+# When returning from Google, exchange the URL 'code' for a valid Supabase user session
 if "code" in query_params:
     auth_code = query_params["code"]
     try:
-        # Exchange the single-use code for a full authenticated web session
         session = supabase.auth.exchange_code_for_session({"auth_code": auth_code})
-        
-        # Package tokens and broadcast them back out to the parent tab, then self-terminate
-        js_callback = f"""
-        <script>
-            if (window.opener) {{
-                window.opener.postMessage({{
-                    type: "OAUTH_SUCCESS",
-                    access_token: "{session.session.access_token}",
-                    refresh_token: "{session.session.refresh_token}"
-                }}, "*");
-                window.close();
-            }}
-        </script>
-        """
-        components.html(js_callback, height=0, width=0)
-        st.info("Authentication complete! Processing session...")
-        st.stop()
+        st.session_state.user = session.user
+        # Clean the temporary code out of the browser URL bar
+        st.query_params.clear()
+        st.rerun()
     except Exception as e:
-        st.error(f"Handshake interception failed: {e}")
-        st.stop()
+        st.error(f"Handshake failed: {e}")
 
-# ==============================================================================
-# 3. PARENT APPLICATION EVENT LISTENER & PERSISTENCE
-# ==============================================================================
-# Injects a listener into the main tab to watch for messages arriving from the popup
-js_listener = """
-<script>
-    window.addEventListener("message", function(event) {
-        if (event.data && event.data.type === "OAUTH_SUCCESS") {
-            // Log tokens to local state context
-            localStorage.setItem("sb_access_token", event.data.access_token);
-            localStorage.setItem("sb_refresh_token", event.data.refresh_token);
-            
-            // Inject reload param to break out of frame loops
-            const url = new URL(window.location.href);
-            url.searchParams.set("login_success", "true");
-            window.location.href = url.toString();
-        }
-    });
-</script>
-"""
-components.html(js_listener, height=0, width=0)
-
-# Catch the reload event param, clean the address bar, and update interface state
-if "login_success" in query_params:
-    st.query_params.clear()
-    st.invalidate_pages()
-    st.rerun()
-
-# Auth Helpers
+# Helper: Generate Google OAuth Link
 def get_google_auth_url():
     response = supabase.auth.sign_in_with_oauth({
         "provider": "google",
@@ -94,13 +50,14 @@ def get_google_auth_url():
     })
     return response.url
 
+# Helper: Logout
 def logout():
     supabase.auth.sign_out()
     if "user" in st.session_state:
         del st.session_state.user
     st.rerun()
 
-# Check for existing background active sessions
+# Check for existing background active session
 if "user" not in st.session_state:
     try:
         current_session = supabase.auth.get_session()
@@ -110,7 +67,7 @@ if "user" not in st.session_state:
         pass
 
 # ==============================================================================
-# 4. APP VIEW ROUTER
+# 3. APP VIEW ROUTER
 # ==============================================================================
 if "user" not in st.session_state:
     # ──────────────────────────────────────────────────────────────────────────
@@ -119,39 +76,12 @@ if "user" not in st.session_state:
     st.title("Welcome to SubTracker 🔑")
     st.write("Please sign in with Google to safely track and manage your subscriptions.")
 
-    # HTML Engine launching Google OAuth inside an isolated, dimensioned modal layout
-    auth_url = get_google_auth_url()
-    popup_launcher_html = f"""
-    <button onclick="openLoginPopup()" style="
-        background-color: #4285F4;
-        color: white;
-        border: none;
-        padding: 12px 24px;
-        font-size: 16px;
-        border-radius: 6px;
-        cursor: pointer;
-        font-weight: bold;
-        display: inline-flex;
-        align-items: center;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.2);
-    ">⚡ Login with Google</button>
-
-    <script>
-        function openLoginPopup() {{
-            const width = 520;
-            const height = 650;
-            const left = (screen.width - width) / 2;
-            const top = (screen.height - height) / 2;
-            
-            window.open(
-                "{auth_url}",
-                "GoogleLoginPopup",
-                `width=${{width}},height=${{height}},top=${{top}},left=${{left}},resizable=yes,scrollbars=yes,status=yes`
-            );
-        }}
-    </script>
-    """
-    components.html(popup_launcher_html, height=70)
+    # Native Streamlit Link Button for standard full-tab redirect
+    try:
+        auth_url = get_google_auth_url()
+        st.link_button("⚡ Login with Google", auth_url, use_container_width=True)
+    except Exception as e:
+        st.error(f"Could not build Google Auth URL: {e}")
 
 else:
     # ──────────────────────────────────────────────────────────────────────────
