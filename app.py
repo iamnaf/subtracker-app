@@ -1,8 +1,7 @@
 import streamlit as st
 from supabase import create_client, Client
 from postgrest.exceptions import APIError
-from datetime import datetime, date
-from dateutil.relativedelta import relativedelta
+from datetime import datetime, date, timedelta
 
 # ==============================================================================
 # 1. INITIALIZE GLOBAL APP CONFIGURATIONS & SUPABASE
@@ -64,16 +63,24 @@ if "user" not in st.session_state:
         pass
 
 # ==============================================================================
-# 3. HELPER FUNCTION: CALCULATE RENEWAL DATE
+# 3. HELPER FUNCTION: ZERO-DEPENDENCY RENEWAL CALCULATION
 # ==============================================================================
 def calculate_next_renewal(start_date: date, cycle: str) -> date:
-    """Calculates the next billing date based on cycle type."""
-    if cycle == "Monthly":
-        return start_date + relativedelta(months=1)
+    """Calculates next billing date using Python standard library only."""
+    if cycle == "Weekly":
+        return start_date + timedelta(days=7)
     elif cycle == "Yearly":
-        return start_date + relativedelta(years=1)
-    elif cycle == "Weekly":
-        return start_date + relativedelta(weeks=1)
+        try:
+            return start_date.replace(year=start_date.year + 1)
+        except ValueError:  # Leap year fallback (Feb 29 -> Feb 28)
+            return start_date + timedelta(days=365)
+    elif cycle == "Monthly":
+        # Standard 30-day billing jump across months
+        month = start_date.month % 12 + 1
+        year = start_date.year + (start_date.month // 12)
+        day = min(start_date.day, [31, 29 if year % 4 == 0 and (year % 100 != 0 or year % 400 == 0) else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1])
+        return date(year, month, day)
+    
     return start_date
 
 # ==============================================================================
@@ -120,11 +127,10 @@ else:
     st.subheader("Add New Subscription")
     with st.form("add_subscription_form", clear_on_submit=True):
         name = st.text_input("Service Name (e.g., Netflix, Spotify)")
-        cost = st.number_input("Cost", min_value=0)
+        cost = st.number_input("Cost", min_value=0.0, step=0.01)
         currency = st.selectbox("Currency", ["USD ($)", "NGN (₦)", "EUR (€)", "GBP (£)"])
         cycle = st.selectbox("Billing Cycle", ["Monthly", "Yearly", "Weekly"])
         
-        # User input for current subscription start date
         current_sub_date = st.date_input("Current / Last Payment Date", value=datetime.today())
         
         submit_button = st.form_submit_button("Save Subscription")
@@ -133,7 +139,6 @@ else:
             if not name:
                 st.error("Please enter a service name.")
             else:
-                # Dynamically calculate next renewal based on cycle
                 computed_next_renewal = calculate_next_renewal(current_sub_date, cycle)
 
                 new_row = {
@@ -147,7 +152,7 @@ else:
                 
                 try:
                     supabase.table("subscriptions").insert(new_row).execute()
-                    st.success(f"Added {name}! Next renewal calculated for {computed_next_renewal.strftime('%Y-%m-%d')}.")
+                    st.success(f"Added {name}! Next renewal set for {computed_next_renewal.strftime('%Y-%m-%d')}.")
                     st.rerun()
                 except APIError as e:
                     st.error("Database policy block or schema structural mismatch.")
