@@ -110,37 +110,80 @@ else:
     st.title("Your Subscription Tracker")
     st.write("Manage your running services and upcoming billings below.")
 
-    # ──── 1. TOP MODULE: Data Display (Active Subscriptions) ────
-    st.subheader("Active Subscriptions")
+    # ──── 1. SUMMARY METRICS MODULE ────
+    today = date.today()
+    full_date_str = today.strftime("%A, %d %B %Y")  # e.g., Tuesday, 21 July 2026
+    current_month_str = today.strftime("%B %Y")      # e.g., July 2026
+    current_year_str = today.strftime("%Y")          # e.g., 2026
+
+    # Fetch subscriptions to compute real-time totals
+    total_month_cost = 0.0
+    total_year_cost = 0.0
     
     try:
         response = supabase.table("subscriptions").select("*").eq("email", user.email).execute()
-        subscriptions = response.data
+        subscriptions = response.data or []
         
-        if subscriptions:
-            # Format and filter raw database output into specified schema columns
-            formatted_data = []
-            for idx, item in enumerate(subscriptions, start=1):
-                formatted_data.append({
-                    "S/N": idx,
-                    "Subscription": item.get("name", "N/A"),
-                    "Cost": f"{float(item.get('cost', 0)):,.2f}",
-                    "Currency": item.get("currency", "N/A"),
-                    "Cycle": item.get("cycle", "N/A"),
-                    "Start Date": item.get("start_date", item.get("created_at", "N/A")),
-                    "Renewal Date": item.get("next_renewal", "N/A")
-                })
-            
-            df = pd.DataFrame(formatted_data)
-            st.dataframe(df, use_container_width=True, hide_index=True)
-        else:
-            st.info("No active subscriptions logged yet. Add one using the form below!")
-    except Exception as e:
-        st.warning("Could not pull data. Verify active SELECT schema rules.")
+        for item in subscriptions:
+            raw_start = item.get("start_date") or item.get("created_at")
+            if raw_start:
+                try:
+                    # Parse start date (supports YYYY-MM-DD)
+                    s_date = datetime.strptime(str(raw_start)[:10], "%Y-%m-%d").date()
+                    item_cost = float(item.get("cost", 0))
+
+                    # Cumulative sum for current year
+                    if s_date.year == today.year:
+                        total_year_cost += item_cost
+                        
+                        # Cumulative sum for current month & year
+                        if s_date.month == today.month:
+                            total_month_cost += item_cost
+                except Exception:
+                    pass
+    except Exception:
+        subscriptions = []
+
+    # Display Metrics Banner
+    st.caption(f"📅 **Today:** {full_date_str}")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric(
+            label=f"Total Cost ({current_month_str})", 
+            value=f"{total_month_cost:,.2f}"
+        )
+    with col2:
+        st.metric(
+            label=f"Total Cost ({current_year_str} YTD)", 
+            value=f"{total_year_cost:,.2f}"
+        )
 
     st.write("---")
 
-    # ──── 2. BOTTOM MODULE: Form block (Add Subscriptions) ────
+    # ──── 2. DATA DISPLAY MODULE (Active Subscriptions) ────
+    st.subheader("Active Subscriptions")
+    
+    if subscriptions:
+        formatted_data = []
+        for idx, item in enumerate(subscriptions, start=1):
+            formatted_data.append({
+                "S/N": idx,
+                "Subscription": item.get("name", "N/A"),
+                "Cost": f"{float(item.get('cost', 0)):,.2f}",
+                "Currency": item.get("currency", "N/A"),
+                "Cycle": item.get("cycle", "N/A"),
+                "Start Date": item.get("start_date", item.get("created_at", "N/A")),
+                "Renewal Date": item.get("next_renewal", "N/A")
+            })
+        
+        df = pd.DataFrame(formatted_data)
+        st.dataframe(df, use_container_width=True, hide_index=True)
+    else:
+        st.info("No active subscriptions logged yet. Add one using the form below!")
+
+    st.write("---")
+
+    # ──── 3. FORM MODULE (Add Subscriptions) ────
     st.subheader("Add New Subscription")
     with st.form("add_subscription_form", clear_on_submit=True):
         name = st.text_input("Service Name (e.g., Netflix, Spotify)")
