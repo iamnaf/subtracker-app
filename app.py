@@ -107,8 +107,8 @@ def convert_currency(amount: float, from_curr: str, to_curr: str, rates: dict) -
         return amount
     
     # Strip symbolic wrappers if present (e.g. "USD ($)" -> "USD")
-    clean_from = from_curr.split()[0]
-    clean_to = to_curr.split()[0]
+    clean_from = str(from_curr).split()[0]
+    clean_to = str(to_curr).split()[0]
     
     rate_from = rates.get(clean_from, 1.0)
     rate_to = rates.get(clean_to, 1.0)
@@ -195,35 +195,120 @@ else:
     with col2:
         st.metric(
             label=f"Total Cost ({current_year_str} YTD)", 
-            value=f"{total_year_cost:,.2f}"
+            value=f"{target_currency_code} {total_year_cost:,.2f}"
         )
 
     st.write("---")
 
-    # ──── 2. DATA DISPLAY MODULE (Active Subscriptions) ────
+    # ──── 2. EDITABLE ACTIVE SUBSCRIPTIONS & ONE-CLICK ACTIONS ────
     st.subheader(f"Active Subscriptions (In {target_currency_code})")
     
     if subscriptions:
-        formatted_data = []
+        # Construct DataFrame for st.data_editor
+        table_rows = []
         for idx, item in enumerate(subscriptions, start=1):
             raw_cost = float(item.get('cost', 0))
             raw_curr = item.get("currency", "USD")
             
-            # Compute live converted cost for each table row
+            # Compute live converted cost for reference
             converted_val = convert_currency(raw_cost, raw_curr, target_currency_code, live_rates)
 
-            formatted_data.append({
+            # Standardize start_date format
+            s_date_str = str(item.get("start_date") or item.get("created_at") or today)[:10]
+
+            table_rows.append({
+                "id": item.get("id"),
                 "S/N": idx,
-                "Subscription": item.get("name", "N/A"),
-                "Original Cost": f"{raw_curr} {raw_cost:,.2f}",
-                f"Cost ({target_currency_code})": f"{target_currency_code} {converted_val:,.2f}",
-                "Cycle": item.get("cycle", "N/A"),
-                "Start Date": item.get("start_date", item.get("created_at", "N/A")),
+                "Service Name": item.get("name", "N/A"),
+                "Cost": raw_cost,
+                "Currency": raw_curr,
+                "Converted Cost": f"{target_currency_code} {converted_val:,.2f}",
+                "Cycle": item.get("cycle", "Monthly"),
+                "Start Date": s_date_str,
                 "Renewal Date": item.get("next_renewal", "N/A")
             })
         
-        df = pd.DataFrame(formatted_data)
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        df = pd.DataFrame(table_rows)
+
+        # Render Interactive Table
+        edited_df = st.data_editor(
+            df,
+            column_config={
+                "id": None,  # Hide internal primary key column
+                "S/N": st.column_config.NumberColumn("S/N", disabled=True, width="small"),
+                "Service Name": st.column_config.TextColumn("Service Name", required=True),
+                "Cost": st.column_config.NumberColumn("Cost", min_value=0.0, format="%.2f", required=True),
+                "Currency": st.column_config.SelectboxColumn("Currency", options=["USD", "NGN", "EUR", "GBP"], required=True),
+                "Converted Cost": st.column_config.TextColumn(f"Cost ({target_currency_code})", disabled=True),
+                "Cycle": st.column_config.SelectboxColumn("Cycle", options=["Monthly", "Yearly", "Weekly"], required=True),
+                "Start Date": st.column_config.TextColumn("Start Date", required=True),
+                "Renewal Date": st.column_config.TextColumn("Renewal Date", disabled=True),
+            },
+            use_container_width=True,
+            hide_index=True,
+            key="subscriptions_editor"
+        )
+
+        # Save inline table edits button
+        if st.button("💾 Save Table Changes", use_container_width=True):
+            try:
+                for idx, row in edited_df.iterrows():
+                    # Recalculate next renewal based on edited start date and cycle
+                    parsed_start = datetime.strptime(str(row["Start Date"])[:10], "%Y-%m-%d").date()
+                    updated_next_renewal = calculate_next_renewal(parsed_start, row["Cycle"])
+
+                    supabase.table("subscriptions").update({
+                        "name": row["Service Name"],
+                        "cost": float(row["Cost"]),
+                        "currency": str(row["Currency"]).split()[0],
+                        "cycle": row["Cycle"],
+                        "start_date": str(parsed_start),
+                        "next_renewal": str(updated_next_renewal)
+                    }).eq("id", row["id"]).execute()
+
+                st.success("Changes saved successfully!")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Failed to update table records: {e}")
+
+        # Quick Actions Drawer (One-Click Renew & Delete)
+        with st.expander("⚡ Row Actions (Renew / Delete Subscription)"):
+            sub_names = {row["id"]: f"{row['Service Name']} ({row['Currency']} {row['Cost']:,.2f})" for _, row in df.iterrows()}
+            selected_sub_id = st.selectbox("Select Subscription", options=list(sub_names.keys()), format_func=lambda x: sub_names[x])
+
+            act_col1, act_col2 = st.columns(2)
+            
+            # One-Click Renew
+            with act_col1:
+                if st.button("⚡ One-Click Renew", use_container_width=True):
+                    sub_item = next((item for item in subscriptions if item["id"] == selected_sub_id), None)
+                    if sub_item:
+                        try:
+                            # Use existing renewal date as the new start date
+                            prev_renewal_str = sub_item.get("next_renewal") or str(today)
+                            new_start = datetime.strptime(prev_renewal_str[:10], "%Y-%m-%d").date()
+                            new_next_renewal = calculate_next_renewal(new_start, sub_item.get("cycle", "Monthly"))
+
+                            supabase.table("subscriptions").update({
+                                "start_date": str(new_start),
+                                "next_renewal": str(new_next_renewal)
+                            }).eq("id", selected_sub_id).execute()
+
+                            st.success(f"Renewed {sub_item['name']}! Next renewal set for {new_next_renewal}.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Could not renew subscription: {e}")
+
+            # Delete Subscription
+            with act_col2:
+                if st.button("🗑️ Delete Subscription", type="secondary", use_container_width=True):
+                    try:
+                        supabase.table("subscriptions").delete().eq("id", selected_sub_id).execute()
+                        st.success("Subscription deleted!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to delete subscription: {e}")
+
     else:
         st.info("No active subscriptions logged yet. Add one using the form below!")
 
