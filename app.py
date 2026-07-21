@@ -98,7 +98,24 @@ else:
     st.title("Your Subscription Tracker")
     st.write("Manage your running services and upcoming billings below.")
 
-    # ──── Form block: Add Subscriptions ────
+    # ──── 1. TOP MODULE: Data Display (Active Subscriptions) ────
+    st.subheader("Active Subscriptions")
+    
+    try:
+        # Filter subscriptions strictly belonging to the logged-in user's email
+        response = supabase.table("subscriptions").select("*").eq("email", user.email).execute()
+        subscriptions = response.data
+        
+        if subscriptions:
+            st.dataframe(subscriptions, use_container_width=True)
+        else:
+            st.info("No active subscriptions logged yet. Add one using the form below!")
+    except Exception as e:
+        st.warning("Could not pull data. Verify active SELECT schema rules.")
+
+    st.write("---")
+
+    # ──── 2. BOTTOM MODULE: Form block (Add Subscriptions) ────
     st.subheader("Add New Subscription")
     with st.form("add_subscription_form", clear_on_submit=True):
         name = st.text_input("Service Name (e.g., Netflix, Spotify)")
@@ -113,14 +130,13 @@ else:
             if not name:
                 st.error("Please enter a service name.")
             else:
-                # 💡 EXACTLY MATCHES YOUR DATABASE SCHEMA
                 new_row = {
-                    "email": user.email,               # Maps to 'email text not null'
-                    "name": name,                      # Maps to 'name text not null'
-                    "cost": cost,                      # Maps to 'cost numeric not null'
-                    "currency": currency.split()[0],   # Maps to 'currency text not null' (e.g., USD)
-                    "cycle": cycle,                    # Maps to 'cycle text not null'
-                    "next_renewal": str(next_renewal)  # Maps to 'next_renewal date not null'
+                    "email": user.email,
+                    "name": name,
+                    "cost": cost,
+                    "currency": currency.split()[0],
+                    "cycle": cycle,
+                    "next_renewal": str(next_renewal)
                 }
                 
                 try:
@@ -132,19 +148,3 @@ else:
                     st.json(e.__dict__) 
                 except Exception as e:
                     st.exception(e)
-
-    # ──── Visualization block: Data Display ────
-    st.write("---")
-    st.subheader("Active Subscriptions")
-    
-    try:
-        # Filter subscriptions strictly belonging to the logged-in user's email
-        response = supabase.table("subscriptions").select("*").eq("email", user.email).execute()
-        subscriptions = response.data
-        
-        if subscriptions:
-            st.dataframe(subscriptions, use_container_width=True)
-        else:
-            st.info("No active subscriptions logged yet. Add one above!")
-    except Exception as e:
-        st.warning("Could not pull data. Verify active SELECT schema rules.")
