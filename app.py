@@ -102,8 +102,10 @@ else:
     st.subheader("Add New Subscription")
     with st.form("add_subscription_form", clear_on_submit=True):
         name = st.text_input("Service Name (e.g., Netflix, Spotify)")
-        cost = st.number_input("Monthly Cost ($)", min_value=0.0, step=0.01)
-        billing_date = st.date_input("Next Billing Date")
+        cost = st.number_input("Cost", min_value=0.0, step=0.01)
+        currency = st.selectbox("Currency", ["USD ($)", "NGN (₦)", "EUR (€)", "GBP (£)"])
+        cycle = st.selectbox("Billing Cycle", ["Monthly", "Yearly", "Weekly"])
+        next_renewal = st.date_input("Next Renewal Date")
         
         submit_button = st.form_submit_button("Save Subscription")
         
@@ -111,11 +113,14 @@ else:
             if not name:
                 st.error("Please enter a service name.")
             else:
+                # 💡 EXACTLY MATCHES YOUR DATABASE SCHEMA
                 new_row = {
-                    "user_id": user.id,  # Link the record to the active authenticated profile
-                    "name": name,
-                    "cost": cost,
-                    "billing_date": str(billing_date)
+                    "email": user.email,               # Maps to 'email text not null'
+                    "name": name,                      # Maps to 'name text not null'
+                    "cost": cost,                      # Maps to 'cost numeric not null'
+                    "currency": currency.split()[0],   # Maps to 'currency text not null' (e.g., USD)
+                    "cycle": cycle,                    # Maps to 'cycle text not null'
+                    "next_renewal": str(next_renewal)  # Maps to 'next_renewal date not null'
                 }
                 
                 try:
@@ -133,8 +138,8 @@ else:
     st.subheader("Active Subscriptions")
     
     try:
-        # Pull records passing through RLS filtering layers (auth.uid() = user_id)
-        response = supabase.table("subscriptions").select("*").execute()
+        # Filter subscriptions strictly belonging to the logged-in user's email
+        response = supabase.table("subscriptions").select("*").eq("email", user.email).execute()
         subscriptions = response.data
         
         if subscriptions:
