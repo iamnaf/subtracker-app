@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import requests
 from supabase import create_client, Client
 from postgrest.exceptions import APIError
 from datetime import datetime, date, timedelta
@@ -64,7 +65,7 @@ if "user" not in st.session_state:
         pass
 
 # ==============================================================================
-# 3. HELPER FUNCTION: ZERO-DEPENDENCY RENEWAL CALCULATION
+# 3. HELPER FUNCTIONS: DATES & LIVE EXCHANGE RATES
 # ==============================================================================
 def calculate_next_renewal(start_date: date, cycle: str) -> date:
     """Calculates next billing date using Python standard library only."""
@@ -86,6 +87,36 @@ def calculate_next_renewal(start_date: date, cycle: str) -> date:
     
     return start_date
 
+@st.cache_data(ttl=3600)  # Cache rates for 1 hour
+def fetch_exchange_rates():
+    """Fetches live USD-based conversion rates from open.er-api.com."""
+    try:
+        url = "https://open.er-api.com/v6/latest/USD"
+        res = requests.get(url, timeout=5)
+        data = res.json()
+        if data.get("result") == "success":
+            return data.get("rates", {})
+    except Exception:
+        pass
+    # Fallback default static matrix in case network API is unreachable
+    return {"USD": 1.0, "NGN": 1500.0, "EUR": 0.92, "GBP": 0.78}
+
+def convert_currency(amount: float, from_curr: str, to_curr: str, rates: dict) -> float:
+    """Converts amount from one currency to target currency using USD baseline rates."""
+    if from_curr == to_curr or amount == 0:
+        return amount
+    
+    # Strip symbolic wrappers if present (e.g. "USD ($)" -> "USD")
+    clean_from = from_curr.split()[0]
+    clean_to = to_curr.split()[0]
+    
+    rate_from = rates.get(clean_from, 1.0)
+    rate_to = rates.get(clean_to, 1.0)
+    
+    # Convert source amount to USD, then from USD to target currency
+    amount_in_usd = amount / rate_from
+    return amount_in_usd * rate_to
+
 # ==============================================================================
 # 4. APP VIEW ROUTER
 # ==============================================================================
@@ -101,9 +132,18 @@ if "user" not in st.session_state:
 
 else:
     user = st.session_state.user
+    live_rates = fetch_exchange_rates()
     
-    st.sidebar.title("SubTracker Dashboard")
+    # Sidebar Module
+    st.sidebar.title("SubTracker Settings")
     st.sidebar.write(f"Logged in as: **{user.email}**")
+    
+    # Default Currency Selection
+    currency_options = ["USD ($)", "NGN (₦)", "EUR (€)", "GBP (£)"]
+    default_currency = st.sidebar.selectbox("Default Preferred Currency", currency_options, index=0)
+    target_currency_code = default_currency.split()[0]
+    
+    st.sidebar.write("---")
     if st.sidebar.button("Log Out", use_container_width=True):
         logout()
 
@@ -112,11 +152,10 @@ else:
 
     # ──── 1. SUMMARY METRICS MODULE ────
     today = date.today()
-    full_date_str = today.strftime("%A, %d %B %Y")  # e.g., Tuesday, 21 July 2026
-    current_month_str = today.strftime("%B %Y")      # e.g., July 2026
-    current_year_str = today.strftime("%Y")          # e.g., 2026
+    full_date_str = today.strftime("%A, %d %B %Y")
+    current_month_str = today.strftime("%B %Y")
+    current_year_str = today.strftime("%Y")
 
-    # Fetch subscriptions to compute real-time totals
     total_month_cost = 0.0
     total_year_cost = 0.0
     
@@ -128,17 +167,18 @@ else:
             raw_start = item.get("start_date") or item.get("created_at")
             if raw_start:
                 try:
-                    # Parse start date (supports YYYY-MM-DD)
                     s_date = datetime.strptime(str(raw_start)[:10], "%Y-%m-%d").date()
                     item_cost = float(item.get("cost", 0))
+                    item_curr = item.get("currency", "USD")
 
-                    # Cumulative sum for current year
+                    # Convert original item cost to chosen user default currency
+                    converted_item_cost = convert_currency(item_cost, item_curr, target_currency_code, live_rates)
+
                     if s_date.year == today.year:
-                        total_year_cost += item_cost
+                        total_year_cost += converted_item_cost
                         
-                        # Cumulative sum for current month & year
                         if s_date.month == today.month:
-                            total_month_cost += item_cost
+                            total_month_cost += converted_item_cost
                 except Exception:
                     pass
     except Exception:
@@ -150,7 +190,7 @@ else:
     with col1:
         st.metric(
             label=f"Total Cost ({current_month_str})", 
-            value=f"{total_month_cost:,.2f}"
+            value=f"{target_currency_code} {total_month_cost:,.2f}"
         )
     with col2:
         st.metric(
@@ -161,16 +201,22 @@ else:
     st.write("---")
 
     # ──── 2. DATA DISPLAY MODULE (Active Subscriptions) ────
-    st.subheader("Active Subscriptions")
+    st.subheader(f"Active Subscriptions (In {target_currency_code})")
     
     if subscriptions:
         formatted_data = []
         for idx, item in enumerate(subscriptions, start=1):
+            raw_cost = float(item.get('cost', 0))
+            raw_curr = item.get("currency", "USD")
+            
+            # Compute live converted cost for each table row
+            converted_val = convert_currency(raw_cost, raw_curr, target_currency_code, live_rates)
+
             formatted_data.append({
                 "S/N": idx,
                 "Subscription": item.get("name", "N/A"),
-                "Cost": f"{float(item.get('cost', 0)):,.2f}",
-                "Currency": item.get("currency", "N/A"),
+                "Original Cost": f"{raw_curr} {raw_cost:,.2f}",
+                f"Cost ({target_currency_code})": f"{target_currency_code} {converted_val:,.2f}",
                 "Cycle": item.get("cycle", "N/A"),
                 "Start Date": item.get("start_date", item.get("created_at", "N/A")),
                 "Renewal Date": item.get("next_renewal", "N/A")
@@ -188,7 +234,7 @@ else:
     with st.form("add_subscription_form", clear_on_submit=True):
         name = st.text_input("Service Name (e.g., Netflix, Spotify)")
         cost = st.number_input("Cost", min_value=0.0, step=0.01)
-        currency = st.selectbox("Currency", ["USD ($)", "NGN (₦)", "EUR (€)", "GBP (£)"])
+        currency = st.selectbox("Currency", currency_options)
         cycle = st.selectbox("Billing Cycle", ["Monthly", "Yearly", "Weekly"])
         
         current_sub_date = st.date_input("Current / Last Payment Date", value=datetime.today())
