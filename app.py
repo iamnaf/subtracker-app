@@ -120,7 +120,7 @@ else:
     st.subheader("Add New Subscription")
     with st.form("add_subscription_form", clear_on_submit=True):
         name = st.text_input("Service Name (e.g., Netflix, Spotify)")
-        cost = st.number_input("Cost", min_value=0.0, step=0.01)
+        cost = st.number_input("Cost", min_value=0)
         currency = st.selectbox("Currency", ["USD ($)", "NGN (₦)", "EUR (€)", "GBP (£)"])
         cycle = st.selectbox("Billing Cycle", ["Monthly", "Yearly", "Weekly"])
         
